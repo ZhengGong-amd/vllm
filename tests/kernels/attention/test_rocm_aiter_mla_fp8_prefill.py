@@ -17,6 +17,7 @@ on every other platform.
 """
 
 import math
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -246,3 +247,38 @@ def test_fp8_prefill_metadata_width_matches_forward(num_heads: int) -> None:
 
     _, _, builder = _build_prefill_metadata([512], torch.device("cuda"), num_heads)
     assert builder.fp8_ps_reduce_partial_map.numel() == _tiles(width)
+
+
+@torch.inference_mode()
+def test_fp8_prefill_metadata_build_does_not_wait_for_queued_work() -> None:
+    """Building the plan must not block on kernels queued on the current stream.
+
+    Under async scheduling those are the previous step's forward, and waiting
+    for them stops the host from running ahead. aiter's `get_ps_metadata_v1`
+    synchronizes the stream it runs on, so the builder must not call it on the
+    current one.
+    """
+    device = torch.device("cuda")
+    metadata, _, builder = _build_prefill_metadata([512], device, 16)
+    common = SimpleNamespace(
+        query_start_loc_cpu=torch.tensor([0, 512], dtype=torch.int32)
+    )
+    torch.cuda.synchronize()
+
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
+    start.record()
+    torch.cuda._sleep(2_000_000_000)
+    end.record()
+    t0 = time.perf_counter()
+    builder._build_fp8_prefill_ps_metadata(metadata, common)
+    host_s = time.perf_counter() - t0
+    end.synchronize()
+    queued_s = start.elapsed_time(end) / 1e3
+
+    assert queued_s > 0.2, f"the stream was busy for only {queued_s:.3f} s"
+    assert host_s < queued_s / 4, (
+        f"build took {host_s:.3f} s behind {queued_s:.3f} s of queued work"
+    )

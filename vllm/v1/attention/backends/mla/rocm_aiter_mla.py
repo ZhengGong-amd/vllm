@@ -1527,12 +1527,16 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             device=device,
         )
 
-        # get_ps_metadata_v1 builds the plan on the host and writes its outputs with
-        # blocking hipMemcpy that is not ordered on the current stream. Writing the
-        # device buffers directly lets step N+1's build (async scheduling) overwrite a
-        # plan that step N's prefill kernels are still reading. Build into pinned host
-        # staging instead and copy on the current stream. Two staging slots, each
-        # reused only after its previous H2D copy has completed.
+        # get_ps_metadata_v1 builds the plan on the host and synchronizes the stream
+        # it runs on around its copies (aiter#6040). On the compute stream that waits
+        # for every forward already queued, so under async scheduling the host stops
+        # running ahead; it runs on a private idle stream instead, with host-only
+        # inputs and outputs. Writing the device buffers directly would let step
+        # N+1's build overwrite a plan that step N's prefill kernels are still
+        # reading, so the plan goes to pinned host staging and is copied on the
+        # current stream. Two staging slots, each reused only after its previous H2D
+        # copy has completed.
+        self._fp8_ps_plan_stream = torch.cuda.Stream(device=device)
         self._fp8_ps_device_outputs = (
             self.fp8_ps_work_indptr,
             self.fp8_ps_work_info,
@@ -1661,24 +1665,25 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         ) = self._fp8_ps_staging[slot]
 
         # work_metadata is not written by the host planner; it stays on device.
-        get_ps_metadata_v1(
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            seq_lens_cpu,
-            gqa_ratio,
-            num_head_k,
-            self.fp8_ps_work_metadata,
-            work_indptr_host,
-            work_info_host,
-            reduce_indptr_host,
-            reduce_final_map_host,
-            reduce_partial_map_host,
-            qhead_granularity=qhead_granularity,
-            qlen_granularity=qlen_granularity,
-            kvlen_granularity=kvlen_granularity,
-            block_size=block_size,
-            is_causal=True,
-        )
+        with torch.cuda.stream(self._fp8_ps_plan_stream):
+            get_ps_metadata_v1(
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                seq_lens_cpu,
+                gqa_ratio,
+                num_head_k,
+                self.fp8_ps_work_metadata,
+                work_indptr_host,
+                work_info_host,
+                reduce_indptr_host,
+                reduce_final_map_host,
+                reduce_partial_map_host,
+                qhead_granularity=qhead_granularity,
+                qlen_granularity=qlen_granularity,
+                kvlen_granularity=kvlen_granularity,
+                block_size=block_size,
+                is_causal=True,
+            )
         for dst, src in zip(self._fp8_ps_device_outputs, self._fp8_ps_staging[slot]):
             dst.copy_(src, non_blocking=True)
         staging_free.record()
